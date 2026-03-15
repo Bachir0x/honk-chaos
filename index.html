@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>HONK CHAOS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { width:100%; height:100%; background:#0a001f; overflow:hidden; }
+#gameCanvas {
+  display:block;
+  margin:0 auto;
+  touch-action:none;
+  outline:none;
+  cursor:none;
+}
+/* On-screen arrow buttons for mobile / when keyboard doesn't work */
+#controls {
+  position:fixed;
+  bottom:18px;
+  left:50%;
+  transform:translateX(-50%);
+  display:flex;
+  gap:12px;
+  z-index:10;
+  user-select:none;
+}
+#controls button {
+  width:64px; height:64px;
+  background:rgba(0,255,255,0.15);
+  border:2px solid #00ffff;
+  border-radius:12px;
+  color:#00ffff;
+  font-size:28px;
+  cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+  touch-action:none;
+}
+#honkBtn {
+  position:fixed;
+  bottom:18px;
+  right:18px;
+  width:80px; height:80px;
+  background:rgba(255,255,0,0.2);
+  border:3px solid #ffff00;
+  border-radius:50%;
+  color:#ffff00;
+  font-size:13px;
+  font-weight:bold;
+  font-family:'Courier New',monospace;
+  cursor:pointer;
+  z-index:10;
+  -webkit-tap-highlight-color:transparent;
+  touch-action:none;
+  line-height:1.2;
+}
+</style>
+</head>
+<body>
+<canvas id="gameCanvas" tabindex="0"></canvas>
+
+<!-- On-screen controls -->
+<div id="controls">
+  <button id="btnLeft">◀</button>
+  <button id="btnRight">▶</button>
+</div>
+<button id="honkBtn">📯<br>HONK</button>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx    = canvas.getContext('2d');
+
+// ── Sizing ────────────────────────────────────────────────
+const LW = 480, LH = 720; // logical size
+let scale = 1;
+function resize() {
+  scale = Math.min(window.innerWidth / LW, window.innerHeight / LH);
+  canvas.width  = Math.round(LW * scale);
+  canvas.height = Math.round(LH * scale);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── Input — three separate systems all write to the same flags ─
+const pressing = { left: false, right: false };
+
+// 1. Keyboard — attached to WINDOW (not canvas) so focus doesn't matter
+window.addEventListener('keydown', e => {
+  if (e.code === 'ArrowLeft'  || e.code === 'KeyA') { pressing.left  = true; e.preventDefault(); }
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') { pressing.right = true; e.preventDefault(); }
+  if (e.code === 'Space') { e.preventDefault(); triggerHonk(); }
+  if (e.code === 'Space' && gameState === 'over') restartGame();
+});
+window.addEventListener('keyup', e => {
+  if (e.code === 'ArrowLeft'  || e.code === 'KeyA') pressing.left  = false;
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') pressing.right = false;
+});
+
+// 2. On-screen buttons
+const btnLeft  = document.getElementById('btnLeft');
+const btnRight = document.getElementById('btnRight');
+function holdLeft(e)  { e.preventDefault(); pressing.left  = true;  }
+function holdRight(e) { e.preventDefault(); pressing.right = true;  }
+function releaseL(e)  { pressing.left  = false; }
+function releaseR(e)  { pressing.right = false; }
+btnLeft.addEventListener('pointerdown',  holdLeft);
+btnLeft.addEventListener('pointerup',    releaseL);
+btnLeft.addEventListener('pointerleave', releaseL);
+btnRight.addEventListener('pointerdown',  holdRight);
+btnRight.addEventListener('pointerup',    releaseR);
+btnRight.addEventListener('pointerleave', releaseR);
+
+// 3. Drag on canvas
+let dragX = null;
+canvas.addEventListener('pointerdown', e => {
+  dragX = e.clientX / scale;
+  if (gameState === 'playing') triggerHonk();
+  else if (gameState === 'over') restartGame();
+});
+canvas.addEventListener('pointermove', e => {
+  if (e.buttons > 0) dragX = e.clientX / scale;
+});
+canvas.addEventListener('pointerup',    () => { dragX = null; pressing.left = false; pressing.right = false; });
+canvas.addEventListener('pointerleave', () => { dragX = null; pressing.left = false; pressing.right = false; });
+
+// Honk button
+document.getElementById('honkBtn').addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (gameState === 'playing') triggerHonk();
+});
+
+// ── Game state ────────────────────────────────────────────
+let gameState = 'playing'; // 'playing' | 'over'
+let score = 0;
+let highScore = parseInt(localStorage.getItem('hc2_hs') || '0', 10);
+let gameSpeed = 4;
+let gameTime = 0;      // frames elapsed
+let speedLevel = 1;    // shown to player
+let combo = 0, comboTimer = 0;
+let lastHonk = 0;
+let frameCount = 0;
+let roadOffset = 0;
+let screenShake = 0;
+
+const ROAD_L = 72, ROAD_R = LW - 72;
+
+const player = {
+  x: LW / 2, y: LH - 130,
+  w: 52, h: 90,
+  vx: 0, tilt: 0,
+  SPEED: 6,
+  honking: false, honkTimer: 0
+};
+
+let rivals = [], orbs = [], particles = [], honkWaves = [], floatTexts = [];
+
+// ── Audio ─────────────────────────────────────────────────
+let audioCtx = null;
+function getACtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+function playHonk() {
+  const c = getACtx();
+  [[180, 0], [225, 0.05]].forEach(([f, d]) => {
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = 'sawtooth'; o.frequency.value = f;
+    g.gain.setValueAtTime(0.4, c.currentTime + d);
+    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + 0.65);
+    o.connect(g).connect(c.destination);
+    o.start(c.currentTime + d); o.stop(c.currentTime + 0.7);
+  });
+}
+function playPing() {
+  const c = getACtx(), o = c.createOscillator(), g = c.createGain();
+  o.type = 'sine'; o.frequency.setValueAtTime(900, c.currentTime);
+  o.frequency.exponentialRampToValueAtTime(1800, c.currentTime + 0.15);
+  g.gain.setValueAtTime(0.3, c.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + 0.25);
+  o.connect(g).connect(c.destination); o.start(); o.stop(c.currentTime + 0.3);
+}
+function playCrash() {
+  const c = getACtx(), n = c.createBufferSource();
+  const buf = c.createBuffer(1, c.sampleRate * 0.7, c.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < buf.length; i++) d[i] = (Math.random()*2-1)*(1-i/buf.length);
+  n.buffer = buf;
+  const g = c.createGain(); g.gain.value = 0.85;
+  g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + 1);
+  n.connect(g).connect(c.destination); n.start();
+}
+
+// ── Spawn ─────────────────────────────────────────────────
+const RIVAL_COLORS = ['#ff3333','#3399ff','#ff9900','#bb44ff','#33ffaa','#ff6699'];
+function spawnRival() {
+  const x = ROAD_L + 36 + Math.random() * (ROAD_R - ROAD_L - 72);
+  rivals.push({
+    x, y: -110, w: 50, h: 88,
+    color: RIVAL_COLORS[Math.floor(Math.random() * RIVAL_COLORS.length)],
+    speed: gameSpeed * (0.9 + Math.random() * 0.35),
+    spin: 0, spinV: 0,
+    tinted: false, tintFrames: 0
+  });
+}
+function spawnOrb() {
+  orbs.push({
+    x: ROAD_L + 20 + Math.random() * (ROAD_R - ROAD_L - 40),
+    y: -30, r: 13, speed: gameSpeed, rot: 0
+  });
+}
+
+// ── Effects ───────────────────────────────────────────────
+function burst(x, y, col, n = 14) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 1.5 + Math.random() * 4.5;
+    particles.push({ x, y, vx: Math.cos(a)*sp, vy: Math.sin(a)*sp,
+      life:1, dec:0.025+Math.random()*0.04, sz:3+Math.random()*5, col });
+  }
+}
+function floatMsg(x, y, msg, col = '#ffff00') {
+  floatTexts.push({ x, y, msg, col, life:1, vy:-1.3 });
+}
+
+// ── Honk ─────────────────────────────────────────────────
+function triggerHonk() {
+  const now = Date.now();
+  if (now - lastHonk < 340) return;
+  lastHonk = now;
+  player.honking = true; player.honkTimer = 18;
+  playHonk();
+  honkWaves.push({ x: player.x, y: player.y - 40, life: 1 });
+
+  let hits = 0;
+  for (const r of rivals) {
+    if (r.y < player.y && r.y > player.y - 340 && Math.abs(r.x - player.x) < 200) {
+      r.tinted = true; r.tintFrames = 40;
+      r.spinV = (Math.random()>.5?1:-1) * (0.2 + Math.random() * 0.25);
+      r.speed = -gameSpeed * 2;
+      const msgs = ['MY EARS!!','TOO LOUD!','WTF?!','HONK YOU!','😵 AHHHH'];
+      floatMsg(r.x, r.y - 55, msgs[Math.floor(Math.random()*msgs.length)]);
+      burst(r.x, r.y, '#ff44ff', 10);
+      hits++;
+    }
+  }
+  if (hits > 0) {
+    combo += hits; comboTimer = 110;
+    score += hits * 120 * Math.max(1, combo);
+    screenShake = 7;
+  }
+}
+
+// ── Car drawing ───────────────────────────────────────────
+function rr(cx, cy, w, h, r, fill, stroke, sw) {
+  ctx.beginPath();
+  ctx.moveTo(cx - w/2 + r, cy - h/2);
+  ctx.lineTo(cx + w/2 - r, cy - h/2);
+  ctx.quadraticCurveTo(cx+w/2, cy-h/2, cx+w/2, cy-h/2+r);
+  ctx.lineTo(cx+w/2, cy+h/2-r);
+  ctx.quadraticCurveTo(cx+w/2, cy+h/2, cx+w/2-r, cy+h/2);
+  ctx.lineTo(cx-w/2+r, cy+h/2);
+  ctx.quadraticCurveTo(cx-w/2, cy+h/2, cx-w/2, cy+h/2-r);
+  ctx.lineTo(cx-w/2, cy-h/2+r);
+  ctx.quadraticCurveTo(cx-w/2, cy-h/2, cx-w/2+r, cy-h/2);
+  ctx.closePath();
+  if (fill)  { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke){ ctx.strokeStyle = stroke; ctx.lineWidth = sw||2; ctx.stroke(); }
+}
+
+function drawCar(x, y, w, h, col, opts = {}) {
+  const { tinted=false, spin=0, isPlayer=false } = opts;
+  ctx.save();
+  ctx.translate(x, y);
+  if (isPlayer) ctx.rotate(player.tilt * 0.18);
+  else ctx.rotate(spin);
+
+  const hw = w/2, hh = h/2;
+
+  // Drop shadow
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.6)';
+  ctx.shadowBlur = 12; ctx.shadowOffsetY = 5;
+  rr(0, 0, w, h, w*0.16, tinted ? '#ff44ff' : col, null);
+  ctx.restore();
+
+  // Body shine
+  const sg = ctx.createLinearGradient(-hw, -hh, hw, hh*0.6);
+  sg.addColorStop(0,'rgba(255,255,255,0.25)');
+  sg.addColorStop(0.45,'rgba(255,255,255,0.06)');
+  sg.addColorStop(1,'rgba(0,0,0,0.2)');
+  rr(0, 0, w, h, w*0.16, sg, null);
+
+  // Windshield (top = front of car)
+  const wsx = -w*0.33, wsy = -hh + h*0.1;
+  const wsw = w*0.66,  wsh = h*0.28;
+  rr(wsx+wsw/2, wsy+wsh/2, wsw, wsh, w*0.1, 'rgba(160,235,255,0.88)', 'rgba(0,0,0,0.25)', 1.5);
+
+  // Rear window
+  const rwsy = hh - h*0.08 - h*0.18;
+  rr(0, rwsy + h*0.09, w*0.6, h*0.18, w*0.09, 'rgba(140,210,255,0.7)', 'rgba(0,0,0,0.2)', 1);
+
+  // Hood crease lines
+  ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.lineWidth = 1.2;
+  [[-w*0.22, -hh+h*0.04, -w*0.22, -hh+h*0.1],
+   [ w*0.22, -hh+h*0.04,  w*0.22, -hh+h*0.1]].forEach(([x1,y1,x2,y2])=>{
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  });
+
+  // Headlights
+  [[-w*0.3, -hh+4],[w*0.3, -hh+4]].forEach(([lx,ly])=>{
+    // glow halo
+    const hg = ctx.createRadialGradient(lx,ly,0,lx,ly,10);
+    hg.addColorStop(0,'rgba(255,252,180,0.7)'); hg.addColorStop(1,'rgba(255,252,180,0)');
+    ctx.beginPath(); ctx.arc(lx,ly,10,0,Math.PI*2);
+    ctx.fillStyle=hg; ctx.fill();
+    // lens
+    ctx.beginPath(); ctx.ellipse(lx,ly,7,4,0,0,Math.PI*2);
+    ctx.fillStyle='#fffde0'; ctx.fill();
+    ctx.strokeStyle='rgba(0,0,0,0.35)'; ctx.lineWidth=1; ctx.stroke();
+  });
+
+  // Tail lights
+  [[-w*0.3, hh-5],[w*0.3, hh-5]].forEach(([lx,ly])=>{
+    ctx.beginPath(); ctx.ellipse(lx,ly,7,3.5,0,0,Math.PI*2);
+    ctx.fillStyle = isPlayer ? (player.honking?'#ff8888':'#ff3333') : '#ff5555';
+    ctx.fill();
+    ctx.strokeStyle='rgba(0,0,0,0.4)'; ctx.lineWidth=1; ctx.stroke();
+  });
+
+  // Wheels
+  const ww=w*0.24, wh=h*0.16;
+  [[-hw-ww*0.3, -hh+h*0.2],[hw-ww*0.7,-hh+h*0.2],
+   [-hw-ww*0.3,  hh-h*0.22],[hw-ww*0.7, hh-h*0.22]].forEach(([wx,wy])=>{
+    rr(wx+ww/2, wy, ww, wh, 3, '#1a1a1a', '#333', 1);
+    ctx.beginPath(); ctx.arc(wx+ww/2, wy, wh*0.35, 0, Math.PI*2);
+    ctx.fillStyle='#888'; ctx.fill();
+    ctx.beginPath(); ctx.arc(wx+ww/2, wy, wh*0.14, 0, Math.PI*2);
+    ctx.fillStyle='#444'; ctx.fill();
+  });
+
+  // Player neon outline
+  if (isPlayer) {
+    const gc = player.honking ? '#ffff00' : '#00ffff';
+    ctx.shadowColor = gc; ctx.shadowBlur = player.honking ? 30 : 16;
+    rr(0, 0, w+6, h+6, w*0.16+3, null, gc, player.honking?4:2.5);
+    ctx.shadowBlur = 0;
+  }
+
+  ctx.restore();
+}
+
+// ── Orb ───────────────────────────────────────────────────
+function drawOrb(o) {
+  ctx.save(); ctx.translate(o.x, o.y); ctx.rotate(o.rot);
+  const g = ctx.createRadialGradient(0,0,2,0,0,o.r*2);
+  g.addColorStop(0,'rgba(255,255,0,0.55)'); g.addColorStop(1,'rgba(255,255,0,0)');
+  ctx.beginPath(); ctx.arc(0,0,o.r*2,0,Math.PI*2);
+  ctx.fillStyle=g; ctx.fill();
+  ctx.beginPath();
+  for (let i=0;i<8;i++){
+    const a=i/8*Math.PI*2, r=i%2?o.r*0.48:o.r;
+    i?ctx.lineTo(Math.cos(a)*r,Math.sin(a)*r):ctx.moveTo(Math.cos(a)*r,Math.sin(a)*r);
+  }
+  ctx.closePath(); ctx.fillStyle='#ffff00'; ctx.fill();
+  ctx.strokeStyle='#00ffff'; ctx.lineWidth=2; ctx.stroke();
+  ctx.restore();
+}
+
+// ── Road ──────────────────────────────────────────────────
+function drawRoad() {
+  // Sidewalks
+  ctx.fillStyle='#150a28';
+  ctx.fillRect(0,0,ROAD_L,LH);
+  ctx.fillRect(ROAD_R,0,LW-ROAD_R,LH);
+  // Asphalt
+  ctx.fillStyle='#181828';
+  ctx.fillRect(ROAD_L,0,ROAD_R-ROAD_L,LH);
+  // Road edge glow
+  ['#ff00cc','#00ffff'].forEach((c,i)=>{
+    ctx.shadowColor=c; ctx.shadowBlur=16;
+    ctx.strokeStyle=c; ctx.lineWidth=3.5;
+    ctx.beginPath();
+    ctx.moveTo(i===0?ROAD_L:ROAD_R,0);
+    ctx.lineTo(i===0?ROAD_L:ROAD_R,LH);
+    ctx.stroke();
+  });
+  ctx.shadowBlur=0;
+  // Dashes
+  roadOffset = (roadOffset + gameSpeed) % 80;
+  ctx.strokeStyle='rgba(255,255,0,0.4)'; ctx.lineWidth=2.5;
+  ctx.setLineDash([38,42]); ctx.lineDashOffset=-roadOffset;
+  [LW/2-55, LW/2+55].forEach(x=>{
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,LH); ctx.stroke();
+  });
+  ctx.setLineDash([]);
+}
+
+// ── HUD ───────────────────────────────────────────────────
+function drawHUD() {
+  ctx.font='bold 38px "Courier New"';
+  ctx.textAlign='left';
+  ctx.fillStyle='#ffff00';
+  ctx.shadowColor='#ff00ff'; ctx.shadowBlur=14;
+  ctx.fillText(Math.floor(score).toString().padStart(6,'0'), 14, 48);
+  ctx.shadowBlur=0;
+  ctx.font='15px "Courier New"'; ctx.fillStyle='#ff66cc';
+  ctx.fillText('HI '+String(highScore).padStart(6,'0'), 14, 68);
+
+  // Speed pip
+  ctx.font='11px "Courier New"'; ctx.fillStyle='rgba(200,200,255,0.5)';
+  ctx.fillText('LVL '+speedLevel+' │ '+'█'.repeat(Math.min(speedLevel,10)), 14, 86);
+
+  if (combo > 1 && comboTimer > 0) {
+    const a = Math.min(1, comboTimer/30);
+    ctx.save(); ctx.globalAlpha=a;
+    ctx.font=`bold ${40+Math.min(combo*3,24)}px "Courier New"`;
+    ctx.textAlign='center';
+    ctx.fillStyle='#00ffff'; ctx.shadowColor='#00ffff'; ctx.shadowBlur=28;
+    ctx.fillText('×'+combo+' COMBO!', LW/2, 115);
+    ctx.shadowBlur=0; ctx.restore();
+  }
+}
+
+function drawGameOver() {
+  ctx.fillStyle='rgba(0,0,0,0.75)';
+  ctx.fillRect(0,0,LW,LH);
+  ctx.textAlign='center';
+  ctx.font='bold 60px "Courier New"';
+  ctx.fillStyle='#ff0066'; ctx.shadowColor='#ffff00'; ctx.shadowBlur=28;
+  ctx.fillText('HONKED OFF!', LW/2, LH/2-90);
+  ctx.shadowBlur=0;
+  ctx.font='bold 34px "Courier New"'; ctx.fillStyle='#ffff00';
+  ctx.fillText('SCORE '+Math.floor(score), LW/2, LH/2-30);
+  if (Math.floor(score) >= highScore && score > 0) {
+    ctx.font='20px "Courier New"'; ctx.fillStyle='#00ffff';
+    ctx.shadowColor='#00ffff'; ctx.shadowBlur=14;
+    ctx.fillText('★ NEW HIGH SCORE ★', LW/2, LH/2+14);
+    ctx.shadowBlur=0;
+  }
+  ctx.font='22px "Courier New"'; ctx.fillStyle='#fff';
+  if (Math.floor(Date.now()/550)%2) ctx.fillText('TAP / SPACE TO RESTART', LW/2, LH/2+64);
+  ctx.textAlign='left';
+}
+
+// ── Update ────────────────────────────────────────────────
+function updatePlayer() {
+  // Keyboard / button
+  if (pressing.left)  player.vx = -player.SPEED;
+  else if (pressing.right) player.vx = player.SPEED;
+  else {
+    // Drag
+    if (dragX !== null) {
+      const diff = dragX - player.x;
+      player.vx = Math.sign(diff) * Math.min(Math.abs(diff) * 0.15, player.SPEED);
+    } else {
+      player.vx *= 0.7;
+    }
+  }
+  player.x = Math.max(ROAD_L+player.w/2+2, Math.min(ROAD_R-player.w/2-2, player.x+player.vx));
+  player.tilt += (player.vx*0.018 - player.tilt) * 0.22;
+  if (player.honkTimer > 0) { player.honkTimer--; if (!player.honkTimer) player.honking=false; }
+}
+
+function updateRivals() {
+  for (let i=rivals.length-1;i>=0;i--) {
+    const r=rivals[i];
+    if (r.speed < gameSpeed) r.speed = Math.min(r.speed+0.12, gameSpeed);
+    r.y += r.speed;
+    r.spin += r.spinV; r.spinV *= 0.93;
+    if (r.tintFrames>0) r.tintFrames--; else r.tinted=false;
+    if (r.y > LH+130) { rivals.splice(i,1); continue; }
+    if (Math.abs(r.x-player.x)<(player.w+r.w)/2-8 &&
+        Math.abs(r.y-player.y)<(player.h+r.h)/2-12) {
+      triggerGameOver(); return;
+    }
+  }
+}
+
+function updateOrbs() {
+  for (let i=orbs.length-1;i>=0;i--) {
+    const o=orbs[i];
+    o.y+=o.speed; o.rot+=0.09;
+    if (o.y>LH+50){ orbs.splice(i,1); continue; }
+    if (Math.abs(o.x-player.x)<player.w/2+o.r &&
+        Math.abs(o.y-player.y)<player.h/2+o.r) {
+      score += 80+combo*15; playPing();
+      burst(o.x,o.y,'#ffff00',16);
+      floatMsg(o.x,o.y-20,'+ORB','#ffff00');
+      orbs.splice(i,1);
+    }
+  }
+}
+
+function updateFX() {
+  for (let i=particles.length-1;i>=0;i--) {
+    const p=particles[i]; p.x+=p.vx; p.y+=p.vy; p.vy+=0.07; p.life-=p.dec;
+    if(p.life<=0) particles.splice(i,1);
+  }
+  for (let i=floatTexts.length-1;i>=0;i--) {
+    const t=floatTexts[i]; t.y+=t.vy; t.life-=0.024;
+    if(t.life<=0) floatTexts.splice(i,1);
+  }
+  for (let i=honkWaves.length-1;i>=0;i--) {
+    honkWaves[i].life-=0.055;
+    if(honkWaves[i].life<=0) honkWaves.splice(i,1);
+  }
+  if (screenShake>0) screenShake*=0.8;
+}
+
+function triggerGameOver() {
+  if (gameState==='over') return;
+  gameState='over'; playCrash(); screenShake=18;
+  if (Math.floor(score)>highScore) {
+    highScore=Math.floor(score);
+    localStorage.setItem('hc2_hs',highScore);
+  }
+}
+
+function restartGame() {
+  gameState='playing'; score=0; gameSpeed=4;
+  combo=0; comboTimer=0; frameCount=0; roadOffset=0; gameTime=0; speedLevel=1;
+  rivals=[]; orbs=[]; particles=[]; honkWaves=[]; floatTexts=[];
+  player.x=LW/2; player.vx=0; player.tilt=0;
+  player.honking=false; player.honkTimer=0;
+  pressing.left=false; pressing.right=false;
+}
+
+// ── Render ────────────────────────────────────────────────
+function render() {
+  ctx.save();
+  ctx.scale(scale, scale);
+  if (screenShake > 0.3) {
+    ctx.translate((Math.random()-.5)*screenShake, (Math.random()-.5)*screenShake);
+  }
+
+  // BG
+  ctx.fillStyle='#0a001f'; ctx.fillRect(0,0,LW,LH);
+  ctx.strokeStyle='rgba(0,255,255,0.04)'; ctx.lineWidth=1;
+  for(let x=0;x<LW;x+=40){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,LH);ctx.stroke();}
+
+  drawRoad();
+
+  // Orbs
+  for (const o of orbs) drawOrb(o);
+
+  // Rivals
+  for (const r of rivals) drawCar(r.x,r.y,r.w,r.h,r.color,{tinted:r.tinted,spin:r.spin});
+
+  // Honk waves
+  for (const w of honkWaves) {
+    const prog = 1-w.life, r = 22 + 250*prog;
+    ctx.beginPath(); ctx.arc(w.x, w.y, r, 0, Math.PI*2);
+    ctx.strokeStyle=`rgba(255,255,0,${w.life*0.65})`;
+    ctx.lineWidth=4*w.life; ctx.shadowColor='#ffff00'; ctx.shadowBlur=18*w.life;
+    ctx.stroke(); ctx.shadowBlur=0;
+  }
+
+  // Particles
+  for (const p of particles) {
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.sz*p.life,0,Math.PI*2);
+    ctx.fillStyle=p.col; ctx.globalAlpha=p.life; ctx.fill();
+  }
+  ctx.globalAlpha=1;
+
+  // Float texts
+  ctx.textAlign='center';
+  for (const t of floatTexts) {
+    ctx.font='bold 19px "Courier New"';
+    ctx.globalAlpha=t.life;
+    ctx.fillStyle=t.col; ctx.shadowColor=t.col; ctx.shadowBlur=10;
+    ctx.fillText(t.msg,t.x,t.y); ctx.shadowBlur=0;
+  }
+  ctx.globalAlpha=1; ctx.textAlign='left';
+
+  // Player
+  drawCar(player.x, player.y, player.w, player.h, '#ff2277', { isPlayer:true });
+
+  drawHUD();
+  if (gameState==='over') drawGameOver();
+
+  ctx.restore();
+}
+
+// ── Loop ──────────────────────────────────────────────────
+function loop() {
+  frameCount++;
+  if (gameState==='playing') {
+    gameTime++;
+    const newLevel = 1 + Math.floor(gameTime / 480);
+    if (newLevel !== speedLevel) { speedLevel = newLevel; floatMsg(LW/2, LH/2-60, '⚡ FASTER! LVL '+speedLevel, '#ff4400'); screenShake = 10; }
+    gameSpeed = Math.min(4 + (speedLevel-1)*1.6, 22);
+    score += 0.4 + gameSpeed*0.04;
+    if (comboTimer>0) comboTimer--; else combo=0;
+    const spawnInterval = Math.max(90-Math.floor(gameSpeed*2.5),45);
+    if (frameCount % spawnInterval === 0) spawnRival();
+    if (frameCount % 110 === 0) spawnOrb();
+    updatePlayer();
+    updateRivals();
+    updateOrbs();
+  }
+  updateFX();
+  render();
+  requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>
